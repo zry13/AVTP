@@ -23,6 +23,7 @@ from typing import Callable, Optional, Union
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -46,7 +47,6 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 
 logger = logging.get_logger(__name__)
-
 
 @use_kernel_forward_from_hub("RMSNorm")
 class Qwen3RMSNorm(nn.Module):
@@ -454,88 +454,77 @@ class Qwen3Model(Qwen3PreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        use_dynamic = False
+        use_dynamic = True
         if use_dynamic:
             # print(f"img start pos: {img_start_pos}")
             # print(f"img end pos: {img_end_pos}")
-            img_flag = [True] * len(img_start_pos)
-            img_features = {}
-            reduce_layers = [2]
-            refull_layers = []
-            pos_emb = {}
-            oral_position_embeddings = position_embeddings
-            oral_attention_mask = attention_mask
+            reduce_layers = [1, 19, 25]
 
+        prev_hidden_states = hidden_states
         for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             # print(f"This is layer: {layer_idx}")
-            
-            if use_dynamic:
-                if hidden_states.size(1) > 1:
-                    if layer_idx in reduce_layers:
-                        attn_weights = layer_outputs[1]
-                        attn_last_query = attn_weights[0, :, -1, :]
-                        seq_len = hidden_states.size(1)
-                        device = hidden_states.device
-                        keep_ratio = 0.5
+            if use_dynamic and hidden_states.size(1) > 1 and layer_idx in reduce_layers:
+                device = hidden_states.device
+                current_hidden_states = hidden_states
+                seq_len = hidden_states.size(1)
+                keep_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+                base_ratio_list = [0.8, 0.8, 0.78]
+                base_ratio = base_ratio_list[reduce_layers.index(layer_idx)]
+
+                img_token_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+                for s, e in zip(img_start_pos, img_end_pos):
+                    img_token_mask[s+1:e] = True
+                keep_mask[~img_token_mask] = True  
                 
-                        keep_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+                img_cos_sim_list = []
+                for img_start, img_end in zip(img_start_pos, img_end_pos):
+                    candidate_indices = torch.arange(img_start, img_end, device=device)
+                    current_candidates = current_hidden_states[:, candidate_indices, :]
+                    prev_candidates = prev_hidden_states[:, candidate_indices, :]
+                    
+                    cos_sim_candidate = F.cosine_similarity(current_candidates, prev_candidates, dim=-1)[0]
+                    img_cos_sim_list.append(cos_sim_candidate)
+                
+                rank_list = [cos_sim[0] for cos_sim in img_cos_sim_list]
+                avg = sum(rank_list) / len(rank_list)
+                ratio_i = [avg - x for x in rank_list]
 
-                        img_token_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
-                        for s, e in zip(img_start_pos, img_end_pos):
-                            img_token_mask[s:e] = True
-                        keep_mask[~img_token_mask] = True 
+                new_img_start_pos, new_img_end_pos = [], []
+                offset = 0
+                for index, (img_start, img_end) in enumerate(zip(img_start_pos, img_end_pos)):
+                    alpha = 1.0
+                    keep_ratio = base_ratio + alpha * ratio_i[index]
+                    keep_ratio = keep_ratio if keep_ratio < 1.0 else 1.0
+                    keep_ratio = keep_ratio if keep_ratio > 0.0 else 0.0
+                    k = max(1, int((img_end-img_start-1) * keep_ratio))
+                    cos_sim_candidate = img_cos_sim_list[index][1:]
+                    topk_indices = torch.topk(cos_sim_candidate, k=k, largest=False).indices
+                    keep_mask[img_start+1:img_end][topk_indices] = True
 
-                        
-                        for start, end in zip(img_start_pos, img_end_pos):
-                            num_img_tokens = end - start
-                            if num_img_tokens <= 0:
-                                continue
-                            attn_scores = attn_last_query[:, start:end].mean(dim=0)
-                            k = max(1, int(num_img_tokens * keep_ratio))
-                            topk_idx = torch.topk(attn_scores, k).indices
-                            keep_mask[start:end][topk_idx] = True
-                        
-                        
-                        all_indices = torch.arange(seq_len, device=device)
-                        keep_indices = all_indices[keep_mask]
-                        pruned_indices = all_indices[~keep_mask]
-                        pruned_hidden_states = hidden_states.index_select(1, pruned_indices)
+                    original_tokens = img_end - img_start + 1
+                    removed_tokens = original_tokens - k
+                    new_start = img_start - offset
+                    new_end = new_start + k - 1
+                    new_img_start_pos.append(new_start)
+                    new_img_end_pos.append(new_end)
+                    offset += removed_tokens
 
-                        hidden_states = hidden_states.index_select(1, keep_indices)
-                        position_embeddings = tuple(pe.index_select(1, keep_indices) for pe in position_embeddings)
-                        if attention_mask is not None:
-                            attention_mask = attention_mask.index_select(2, keep_indices)
-                            attention_mask = attention_mask.index_select(3, keep_indices)
+                img_start_pos, img_end_pos = new_img_start_pos, new_img_end_pos
+                
+                all_indices = torch.arange(seq_len, device=device)
+                keep_indices = all_indices[keep_mask]
+                # pruned_indices = all_indices[~keep_mask]
+                # pruned_hidden_states = hidden_states.index_select(1, pruned_indices)
 
-                        prune_info = {
-                            "keep_indices": keep_indices,
-                            "pruned_indices": pruned_indices,
-                            "pruned_hidden_states": pruned_hidden_states,
-                            # "pruned_position_embeddings": pruned_position_embeddings,
-                        }
-
-                    if layer_idx in refull_layers:
-                        orig_seq_len = len(prune_info["keep_indices"]) + len(prune_info["pruned_indices"])
-                        hidden_dim = hidden_states.size(-1)
-                        device = hidden_states.device
-                        keep_indices = prune_info["keep_indices"]
-                        pruned_indices = prune_info["pruned_indices"]
-
-                        restored_hidden_states = torch.empty(1, orig_seq_len, hidden_dim, device=device, dtype=hidden_states.dtype)
-
-                        restored_hidden_states[:, keep_indices, :] = hidden_states
-
-                        restored_hidden_states[:, pruned_indices, :] = prune_info["pruned_hidden_states"]
-
-                        hidden_states = restored_hidden_states
-
-                        position_embeddings = oral_position_embeddings
-                        if attention_mask is not None:
-                            attention_mask = oral_attention_mask
-
-
+                hidden_states = hidden_states.index_select(1, keep_indices)
+                position_embeddings = tuple(pe.index_select(1, keep_indices) for pe in position_embeddings)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.index_select(2, keep_indices)
+                    attention_mask = attention_mask.index_select(3, keep_indices)
+            
+                prev_hidden_states = hidden_states
             # modify end
 
             layer_outputs = decoder_layer(

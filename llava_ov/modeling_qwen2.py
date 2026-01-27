@@ -845,7 +845,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if use_dynamic:
             # print(f"img start pos: {img_start_pos}")
             # print(f"img end pos: {img_end_pos}")
-            reduce_layers = [2, 15]
+            reduce_layers = [1]
         prev_hidden_states = hidden_states
 
         for layer_idx, decoder_layer in enumerate(self.layers):
@@ -857,10 +857,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 current_hidden_states = hidden_states
                 seq_len = hidden_states.size(1)
                 keep_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
-                if layer_idx == 2:
-                    base_ratio = 0.75
-                elif layer_idx ==15:
-                    base_ratio = 0.67
+
+                base_ratio = 0.5
 
                 img_token_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
                 for s, e in zip(img_start_pos, img_end_pos):
@@ -885,7 +883,10 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 new_img_start_pos, new_img_end_pos = [], []
                 offset = 0
                 for index, (img_start, img_end) in enumerate(zip(img_start_pos, img_end_pos)):
-                    keep_ratio = base_ratio + ratio_i[index]
+                    alpha = 1.0
+                    keep_ratio = base_ratio + alpha * ratio_i[index]
+                    keep_ratio = keep_ratio if keep_ratio < 1.0 else 1.0
+                    keep_ratio = keep_ratio if keep_ratio > 0.0 else 0.0
                     k = max(1, int((img_end-img_start-1) * keep_ratio))
                     cos_sim_candidate = img_cos_sim_list[index][1:]
                     topk_indices = torch.topk(cos_sim_candidate, k=k, largest=False).indices
